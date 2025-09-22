@@ -67,4 +67,178 @@ CREATE TABLE IF NOT EXISTS `{TABLE}` (
     `VALID_DURATION`     DECIMAL(10,2)            COMMENT '有效工时',
     `IDLING_DURATION`    DECIMAL(10,2)            COMMENT '怠速工时',
     `VALID_PERCENT`      DECIMAL(10,2)            COMMENT '工时有效比(%)',
-    `DAY_OIL`            DECIMAL(12,2)_
+    `DAY_OIL`            DECIMAL(12,2)            COMMENT '当日油耗(L)',
+    `DAY_REFUEL`         DECIMAL(12,2)            COMMENT '当日加油(L)',
+    `DAY_MILEAGE`        DECIMAL(12,2)            COMMENT '当日里程(km)',
+    `WORKHOUR_AVG_OIL`   DECIMAL(12,2)            COMMENT '工时场景平均油耗(L/h)',
+    `TRANSPORT_AVG_OIL`  DECIMAL(12,2)            COMMENT '运输场景平均油耗(L/100km)',
+    `COMPANY_ASSETS`     VARCHAR(128)             COMMENT '资产归属',
+    `BELONG_LAND`        VARCHAR(128)             COMMENT '所属地块',
+    `CREATE_TIME`        DATETIME                 COMMENT '进场/创建时间',
+    `SCORE`              INT                      COMMENT 'AI 评分',
+    `SUMMARY`            TEXT                     COMMENT 'AI 总结',
+    PRIMARY KEY (`ID`),
+    UNIQUE KEY `UK_DEVICE_DATE` (`DEVICE_NO`, `DATE_STR`),
+    KEY `IDX_DATE` (`DATE_STR`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='工时通日报数据(含 AI 评分/总结)';
+"""
+
+# ===== UPSERT（设备+日期唯一）=====
+UPSERT_SQL = f"""
+INSERT INTO `{TABLE}` (
+    DEVICE_NO, PROJECT_NAME, MECHANICAL_NO, DATE_STR, RENT_TYPE,
+    TYPE_NAME, CAR_TYPE, VALID_DURATION, IDLING_DURATION, VALID_PERCENT,
+    DAY_OIL, DAY_REFUEL, DAY_MILEAGE, WORKHOUR_AVG_OIL, TRANSPORT_AVG_OIL,
+    COMPANY_ASSETS, BELONG_LAND, CREATE_TIME, SCORE, SUMMARY
+) VALUES (
+    %(DEVICE_NO)s, %(PROJECT_NAME)s, %(MECHANICAL_NO)s, %(DATE_STR)s, %(RENT_TYPE)s,
+    %(TYPE_NAME)s, %(CAR_TYPE)s, %(VALID_DURATION)s, %(IDLING_DURATION)s, %(VALID_PERCENT)s,
+    %(DAY_OIL)s, %(DAY_REFUEL)s, %(DAY_MILEAGE)s, %(WORKHOUR_AVG_OIL)s, %(TRANSPORT_AVG_OIL)s,
+    %(COMPANY_ASSETS)s, %(BELONG_LAND)s, %(CREATE_TIME)s, %(SCORE)s, %(SUMMARY)s
+) ON DUPLICATE KEY UPDATE
+    PROJECT_NAME=VALUES(PROJECT_NAME),
+    MECHANICAL_NO=VALUES(MECHANICAL_NO),
+    RENT_TYPE=VALUES(RENT_TYPE),
+    TYPE_NAME=VALUES(TYPE_NAME),
+    CAR_TYPE=VALUES(CAR_TYPE),
+    VALID_DURATION=VALUES(VALID_DURATION),
+    IDLING_DURATION=VALUES(IDLING_DURATION),
+    VALID_PERCENT=VALUES(VALID_PERCENT),
+    DAY_OIL=VALUES(DAY_OIL),
+    DAY_REFUEL=VALUES(DAY_REFUEL),
+    DAY_MILEAGE=VALUES(DAY_MILEAGE),
+    WORKHOUR_AVG_OIL=VALUES(WORKHOUR_AVG_OIL),
+    TRANSPORT_AVG_OIL=VALUES(TRANSPORT_AVG_OIL),
+    COMPANY_ASSETS=VALUES(COMPANY_ASSETS),
+    BELONG_LAND=VALUES(BELONG_LAND),
+    CREATE_TIME=VALUES(CREATE_TIME),
+    SCORE=VALUES(SCORE),
+    SUMMARY=VALUES(SUMMARY);
+"""
+
+# ===== 小工具 =====
+def to_decimal(x: Any):
+    if x is None or str(x).strip() == "" or str(x).lower() == "null":
+        return None
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def to_int(x: Any):
+    try:
+        return int(float(x))
+    except Exception:
+        return None
+
+def to_date(x: Any):
+    if not x:
+        return None
+    s = str(x).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date().strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+def to_datetime(x: Any):
+    if not x:
+        return None
+    s = str(x).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+def extract_list(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("dataList", "result", "data"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                return v
+    return []
+
+# ===== 接口请求（POST）=====
+def fetch_api(date_str: str) -> List[Dict[str, Any]]:
+    url = f"{API_BASE}{API_PATH}"
+    payload = {"dateStr": date_str}
+    logging.info(f"POST {url} json={payload}")
+    r = requests.post(url, headers=API_HEADERS, json=payload, timeout=API_TIMEOUT)
+    r.raise_for_status()
+    rows = extract_list(r.json())
+    logging.info(f"rows: {len(rows)}")
+    if rows[:1]:
+        logging.info(f"sample: {json.dumps(rows[0], ensure_ascii=False)}")
+    return rows
+
+def map_row(r: Dict[str, Any], date_str: str) -> Dict[str, Any]:
+    return {
+        "DEVICE_NO":         (r.get("deviceNo") or r.get("DEVICE_NO") or "")[:64],
+        "PROJECT_NAME":      r.get("projectName"),
+        "MECHANICAL_NO":     r.get("mechanicalNo"),
+        "DATE_STR":          to_date(r.get("dateStr")) or date_str,
+        "RENT_TYPE":         str(r.get("rentType")) if r.get("rentType") is not None else None,
+        "TYPE_NAME":         r.get("typeName"),
+        "CAR_TYPE":          r.get("carType"),
+        "VALID_DURATION":    to_decimal(r.get("validDuration")),
+        "IDLING_DURATION":   to_decimal(r.get("idlingDuration")),
+        "VALID_PERCENT":     to_decimal(r.get("validPercent")),
+        "DAY_OIL":           to_decimal(r.get("dayOil")),
+        "DAY_REFUEL":        to_decimal(r.get("dayRefuel")),
+        "DAY_MILEAGE":       to_decimal(r.get("dayMileage")),
+        "WORKHOUR_AVG_OIL":  to_decimal(r.get("workhourAvgOil")),
+        "TRANSPORT_AVG_OIL": to_decimal(r.get("transportAvgOil")),
+        "COMPANY_ASSETS":    r.get("companyAssets"),
+        "BELONG_LAND":       r.get("belongLand"),
+        "CREATE_TIME":       to_datetime(r.get("createTime")),
+        "SCORE":             to_int(r.get("score")),
+        "SUMMARY":           r.get("summary"),
+    }
+
+def get_conn():
+    return mysql.connector.connect(**DB_CONFIG)
+
+def ensure_table(cur):
+    cur.execute(CREATE_TABLE_SQL)
+
+def upsert(rows: List[Dict[str, Any]]):
+    if not rows:
+        logging.info("no rows to write")
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        ensure_table(cur)
+        cur.executemany(UPSERT_SQL, rows)
+        conn.commit()
+        logging.info(f"upsert OK: {cur.rowcount} rows")
+    except mysql.connector.Error as e:
+        conn.rollback()
+        logging.error(f"DB write failed: {e}")
+        sys.exit(1)
+    finally:
+        cur.close()
+        conn.close()
+
+def main():
+    logging.info(f"Start sync -> table={TABLE} date={DATE_STR}")
+    raw = fetch_api(DATE_STR)
+    mapped = [map_row(r, DATE_STR) for r in raw if r.get("deviceNo") or r.get("DEVICE_NO")]
+    mapped = [m for m in mapped if m.get("DATE_STR")]
+    logging.info(f"ready to write: {len(mapped)}")
+    upsert(mapped)
+    logging.info("Done")
+
+if __name__ == "__main__":
+    main()
