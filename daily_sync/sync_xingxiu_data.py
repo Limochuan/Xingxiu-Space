@@ -1,6 +1,9 @@
 """
 Module: daily_sync/sync_xingxiu_data.py
 Purpose: 从 ai_export 接口抓取“昨天(Asia/Jakarta)”的数据，写入 xingxiu.xingxiu（含 AI 评分/总结）
+Notes:
+- 改为 POST + Query Params（与 Postman 一致），避免返回全 0 的问题
+- 支持可选的 API_KEY（Secrets 设置 API_KEY 即可自动带上 ?key=xxx）
 Author: Jimmy 张杰铭
 Updated: 2025-09-22
 """
@@ -26,7 +29,8 @@ logging.basicConfig(
 API_BASE = "http://119.47.88.14:81"
 API_PATH = "/admin/common/mechanical/ai_export"
 API_TIMEOUT = 30  # seconds
-API_HEADERS = {"Content-Type": "application/json; charset=utf-8"}
+# Postman 使用的是 Query Params，所以这里不用 JSON 头
+API_HEADERS = {"Accept": "application/json"}
 
 # ===== 取“雅加达昨天”或命令行参数 =====
 def target_date_str() -> str:
@@ -39,18 +43,17 @@ DATE_STR = target_date_str()
 logging.info(f"Target date (Asia/Jakarta yesterday or argv): {DATE_STR}")
 
 # ===== DB 配置（仓库 Secrets / 环境变量）=====
-# 记得把 DB_NAME 设置为 xingxiu
 DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
     "port": int(os.getenv("DB_PORT", "3306")),
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASS"),
-    "database": os.getenv("DB_NAME"),   # ← 在 Secrets 设置为 xingxiu
+    "database": os.getenv("DB_NAME"),   # 建议设置为 xingxiu
     "charset": "utf8mb4",
     "autocommit": False,
 }
 
-# ===== 目标表（表名固定：xingxiu）=====
+# ===== 目标表 =====
 TABLE = "xingxiu"
 
 # ===== 建表 SQL：字段中文注释 =====
@@ -121,13 +124,18 @@ def to_decimal(x: Any):
     if x is None or str(x).strip() == "" or str(x).lower() == "null":
         return None
     try:
-        return float(x)
+        # 兼容 "1,234.56" 或 "1.234,56" 这类格式
+        s = str(x).replace(",", "")
+        return float(s)
     except Exception:
-        return None
+        try:
+            return float(x)
+        except Exception:
+            return None
 
 def to_int(x: Any):
     try:
-        return int(float(x))
+        return int(float(str(x).replace(",", "")))
     except Exception:
         return None
 
@@ -169,14 +177,21 @@ def extract_list(payload: Any) -> List[Dict[str, Any]]:
                 return v
     return []
 
-# ===== 接口请求（POST）=====
+# ===== 接口请求（关键修复：POST + Query Params；支持 key）=====
 def fetch_api(date_str: str) -> List[Dict[str, Any]]:
     url = f"{API_BASE}{API_PATH}"
-    payload = {"dateStr": date_str}
-    logging.info(f"POST {url} json={payload}")
-    r = requests.post(url, headers=API_HEADERS, json=payload, timeout=API_TIMEOUT)
+    params = {"dateStr": date_str}
+    api_key = os.getenv("API_KEY") or os.getenv("API_TOKEN") or os.getenv("KEY")
+    if api_key:
+        params["key"] = api_key
+    logging.info(f"POST {url} params={params}")
+    r = requests.post(url, headers=API_HEADERS, params=params, timeout=API_TIMEOUT)
     r.raise_for_status()
-    rows = extract_list(r.json())
+    data = r.json()
+    rows = extract_list(data)
+    # 如果外层不是 dataList/result/data，而是直接 list
+    if not rows and isinstance(data, list):
+        rows = data
     logging.info(f"rows: {len(rows)}")
     if rows[:1]:
         logging.info(f"sample: {json.dumps(rows[0], ensure_ascii=False)}")
@@ -190,7 +205,7 @@ def map_row(r: Dict[str, Any], date_str: str) -> Dict[str, Any]:
         "DATE_STR":          to_date(r.get("dateStr")) or date_str,
         "RENT_TYPE":         str(r.get("rentType")) if r.get("rentType") is not None else None,
         "TYPE_NAME":         r.get("typeName"),
-        "CAR_TYPE":          r.get("carType"),
+        "CAR_TYPE":          r.get("carType") or r.get("catType"),
         "VALID_DURATION":    to_decimal(r.get("validDuration")),
         "IDLING_DURATION":   to_decimal(r.get("idlingDuration")),
         "VALID_PERCENT":     to_decimal(r.get("validPercent")),
@@ -234,7 +249,7 @@ def upsert(rows: List[Dict[str, Any]]):
 def main():
     logging.info(f"Start sync -> table={TABLE} date={DATE_STR}")
     raw = fetch_api(DATE_STR)
-    mapped = [map_row(r, DATE_STR) for r in raw if r.get("deviceNo") or r.get("DEVICE_NO")]
+    mapped = [map_row(r, DATE_STR) for r in raw if (r.get("deviceNo") or r.get("DEVICE_NO"))]
     mapped = [m for m in mapped if m.get("DATE_STR")]
     logging.info(f"ready to write: {len(mapped)}")
     upsert(mapped)
