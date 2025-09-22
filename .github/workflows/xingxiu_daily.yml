@@ -2,7 +2,7 @@ name: Daily Sync Xingxiu
 
 on:
   schedule:
-    # Jakarta 01:30 = UTC 18:30 (上一日)
+    # Jakarta 01:30 = UTC 18:30
     - cron: '30 18 * * *'
   workflow_dispatch:
 
@@ -19,7 +19,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r daily_sync/requirements.txt
 
       - name: Run sync script
         env:
@@ -27,6 +27,6 @@ jobs:
           DB_PORT: ${{ secrets.DB_PORT }}
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASS: ${{ secrets.DB_PASS }}
-          DB_NAME: ${{ secrets.DB_NAME }}   # 设成你的库名（例如 xingxiu_db）
-          API_KEY: ${{ secrets.API_KEY }}   # 若接口需要 key，就设置；不需要可不配
-        run: python sync_xingxiu_data.py
+          DB_NAME: ${{ secrets.DB_NAME }}
+          API_KEY: ${{ secrets.API_KEY }}
+        run: python daily_sync/sync_xingxiu_data.py
