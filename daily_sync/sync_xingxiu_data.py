@@ -1,20 +1,17 @@
 """
 Script: sync_xingxiu_data.py
-Purpose: 每天雅加达 01:30 抓“昨天”的接口数据，入库到表 `xingxiu`
-Notes:
-POST + Query Params (?dateStr=YYYY-MM-DD[&key=...])
+Purpose: 同步数据到数据库表 `xingxiu`
+Author: Jimmy 张杰铭
+Updated: 2025-09-22
 """
 
-import os
 import sys
-import json
+import os
 import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
-
 import requests
 import mysql.connector
-from zoneinfo import ZoneInfo
 
 # 日志
 logging.basicConfig(
@@ -23,188 +20,122 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
-# ---- 接口配置 ----
+# API 配置
 API_URL = "http://119.47.88.14:81/admin/common/mechanical/ai_export"
-API_HEADERS = {"Accept": "application/json"}
+API_HEADERS = {"Content-Type": "application/json"}
 
-def jakarta_yesterday_str() -> str:
-    now_jkt = datetime.now(ZoneInfo("Asia/Jakarta"))
-    return (now_jkt - timedelta(days=1)).strftime("%Y-%m-%d")
-
-# 支持命令行覆盖日期；默认“雅加达昨天”
-DATE_STR = sys.argv[1].strip() if len(sys.argv) > 1 and sys.argv[1].strip() else jakarta_yesterday_str()
-
-# 可选 key（Secrets 里设置 API_KEY）
-API_PARAMS = {"dateStr": DATE_STR}
-if os.getenv("API_KEY"):
-    API_PARAMS["key"] = os.getenv("API_KEY")
-
-# ---- DB 配置（DB_NAME 设为你的库名，例如 xingxiu_db）----
+# 数据库配置
 DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
-    "port": int(os.getenv("DB_PORT", "3306")),
+    "port": int(os.getenv("DB_PORT")),
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASS"),
-    "database": os.getenv("DB_NAME"),
+    "database": os.getenv("DB_NAME"),  # xingxiu_db
     "charset": "utf8mb4",
     "autocommit": False,
 }
 
 TABLE_NAME = "xingxiu"
 
-# 建表（中文注释）
+# 建表 SQL
 TABLE_SCHEMA_SQL = f"""
 CREATE TABLE IF NOT EXISTS `{TABLE_NAME}` (
-  `ID`                 BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
-  `DEVICE_NO`          VARCHAR(64)     NOT NULL COMMENT '工时通设备编号',
-  `PROJECT_NAME`       VARCHAR(128)             COMMENT '项目名称',
-  `MECHANICAL_NO`      VARCHAR(64)              COMMENT '园区机械编号',
-  `DATE_STR`           DATE            NOT NULL COMMENT '日期',
-  `RENT_TYPE`          VARCHAR(64)              COMMENT '租用方式',
-  `TYPE_NAME`          VARCHAR(128)             COMMENT '机械品牌/类别/型号',
-  `CAR_TYPE`           VARCHAR(64)              COMMENT '车辆/机械类别',
-  `VALID_DURATION`     DECIMAL(10,2)            COMMENT '有效工时',
-  `IDLING_DURATION`    DECIMAL(10,2)            COMMENT '怠速工时',
-  `VALID_PERCENT`      DECIMAL(10,2)            COMMENT '工时有效比(%)',
-  `DAY_OIL`            DECIMAL(12,2)            COMMENT '当日油耗(L)',
-  `DAY_REFUEL`         DECIMAL(12,2)            COMMENT '当日加油(L)',
-  `DAY_MILEAGE`        DECIMAL(12,2)            COMMENT '当日里程(km)',
-  `WORKHOUR_AVG_OIL`   DECIMAL(12,2)            COMMENT '工时场景平均油耗(L/h)',
-  `TRANSPORT_AVG_OIL`  DECIMAL(12,2)            COMMENT '运输场景平均油耗(L/100km)',
-  `COMPANY_ASSETS`     VARCHAR(128)             COMMENT '资产归属',
-  `BELONG_LAND`        VARCHAR(128)             COMMENT '所属地块',
-  `CREATE_TIME`        DATETIME                 COMMENT '进场/创建时间',
-  `SCORE`              INT                      COMMENT 'AI 评分',
-  `SUMMARY`            TEXT                     COMMENT 'AI 总结',
-  PRIMARY KEY (`ID`),
-  UNIQUE KEY `uniq_device_date` (`DEVICE_NO`,`DATE_STR`),
-  KEY `idx_date` (`DATE_STR`)
+    `ID` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    `DEVICE_NO` VARCHAR(64) NOT NULL COMMENT '设备编号',
+    `PROJECT_NAME` VARCHAR(128) COMMENT '项目名称',
+    `MECHANICAL_NO` VARCHAR(64) COMMENT '机械编号',
+    `TYPE_NAME` VARCHAR(128) COMMENT '机械品牌型号',
+    `CAR_TYPE` VARCHAR(64) COMMENT '机械类别',
+    `RENT_TYPE` VARCHAR(32) COMMENT '租用方式',
+    `STANDARD_OIL` DECIMAL(12,2) COMMENT '标准油耗',
+    `PRICE` DECIMAL(12,2) COMMENT '单价',
+    `VALID_DURATION` DECIMAL(12,2) COMMENT '有效工时',
+    `IDLING_DURATION` DECIMAL(12,2) COMMENT '怠速工时',
+    `DAY_OIL` DECIMAL(12,2) COMMENT '当日油耗',
+    `DAY_REFUEL` DECIMAL(12,2) COMMENT '当日加油',
+    `DAY_MILEAGE` DECIMAL(12,2) COMMENT '当日里程',
+    `VALID_PERCENT` DECIMAL(5,2) COMMENT '工时有效比',
+    `WORKHOUR_AVG_OIL` DECIMAL(12,2) COMMENT '工时油耗',
+    `TRANSPORT_AVG_OIL` DECIMAL(12,2) COMMENT '运输油耗',
+    `DATE_STR` DATE NOT NULL COMMENT '日期',
+    PRIMARY KEY (`ID`),
+    UNIQUE KEY `uniq_device_date` (`DEVICE_NO`, `DATE_STR`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='星宿日报数据';
 """
 
-# 插入/更新（设备+日期去重）
+# 插入 SQL
 INSERT_SQL = f"""
 INSERT INTO `{TABLE_NAME}` (
-  DEVICE_NO, PROJECT_NAME, DATE_STR, RENT_TYPE, MECHANICAL_NO, CREATE_TIME,
-  TYPE_NAME, CAR_TYPE, VALID_DURATION, IDLING_DURATION, VALID_PERCENT,
-  DAY_OIL, DAY_REFUEL, DAY_MILEAGE, WORKHOUR_AVG_OIL, TRANSPORT_AVG_OIL,
-  COMPANY_ASSETS, BELONG_LAND, SCORE, SUMMARY
+    DEVICE_NO, PROJECT_NAME, MECHANICAL_NO, TYPE_NAME, CAR_TYPE,
+    RENT_TYPE, STANDARD_OIL, PRICE, VALID_DURATION, IDLING_DURATION,
+    DAY_OIL, DAY_REFUEL, DAY_MILEAGE, VALID_PERCENT, WORKHOUR_AVG_OIL,
+    TRANSPORT_AVG_OIL, DATE_STR
 ) VALUES (
-  %(deviceNo)s, %(projectName)s, %(dateStr)s, %(rentType)s, %(mechanicalNo)s, %(createTime)s,
-  %(typeName)s, %(carType)s, %(validDuration)s, %(idlingDuration)s, %(validPercent)s,
-  %(dayOil)s, %(dayRefuel)s, %(dayMileage)s, %(workhourAvgOil)s, %(transportAvgOil)s,
-  %(companyAssets)s, %(belongLand)s, %(score)s, %(summary)s
+    %(deviceNo)s, %(projectName)s, %(mechanicalNo)s, %(typeName)s, %(carType)s,
+    %(rentType)s, %(standardOil)s, %(price)s, %(validDuration)s, %(idlingDuration)s,
+    %(dayOil)s, %(dayRefuel)s, %(dayMileage)s, %(validPercent)s, %(workhourAvgOil)s,
+    %(transportAvgOil)s, %(dateStr)s
 ) ON DUPLICATE KEY UPDATE
-  PROJECT_NAME=VALUES(PROJECT_NAME),
-  RENT_TYPE=VALUES(RENT_TYPE),
-  MECHANICAL_NO=VALUES(MECHANICAL_NO),
-  CREATE_TIME=VALUES(CREATE_TIME),
-  TYPE_NAME=VALUES(TYPE_NAME),
-  CAR_TYPE=VALUES(CAR_TYPE),
-  VALID_DURATION=VALUES(VALID_DURATION),
-  IDLING_DURATION=VALUES(IDLING_DURATION),
-  VALID_PERCENT=VALUES(VALID_PERCENT),
-  DAY_OIL=VALUES(DAY_OIL),
-  DAY_REFUEL=VALUES(DAY_REFUEL),
-  DAY_MILEAGE=VALUES(DAY_MILEAGE),
-  WORKHOUR_AVG_OIL=VALUES(WORKHOUR_AVG_OIL),
-  TRANSPORT_AVG_OIL=VALUES(TRANSPORT_AVG_OIL),
-  COMPANY_ASSETS=VALUES(COMPANY_ASSETS),
-  BELONG_LAND=VALUES(BELONG_LAND),
-  SCORE=VALUES(SCORE),
-  SUMMARY=VALUES(SUMMARY);
+    PROJECT_NAME=VALUES(PROJECT_NAME),
+    MECHANICAL_NO=VALUES(MECHANICAL_NO),
+    TYPE_NAME=VALUES(TYPE_NAME),
+    CAR_TYPE=VALUES(CAR_TYPE),
+    RENT_TYPE=VALUES(RENT_TYPE),
+    STANDARD_OIL=VALUES(STANDARD_OIL),
+    PRICE=VALUES(PRICE),
+    VALID_DURATION=VALUES(VALID_DURATION),
+    IDLING_DURATION=VALUES(IDLING_DURATION),
+    DAY_OIL=VALUES(DAY_OIL),
+    DAY_REFUEL=VALUES(DAY_REFUEL),
+    DAY_MILEAGE=VALUES(DAY_MILEAGE),
+    VALID_PERCENT=VALUES(VALID_PERCENT),
+    WORKHOUR_AVG_OIL=VALUES(WORKHOUR_AVG_OIL),
+    TRANSPORT_AVG_OIL=VALUES(TRANSPORT_AVG_OIL);
 """
 
-def normalize_date(s: str) -> str:
+def fetch_api(date_str: str) -> List[Dict[str, Any]]:
     try:
-        y, m, d = [int(i) for i in str(s).split("-")]
-        return datetime(y, m, d).strftime("%Y-%m-%d")
-    except Exception:
-        return str(s)
-
-def fetch_api() -> List[Dict[str, Any]]:
-    logging.info(f"POST {API_URL} params={API_PARAMS}")
-    r = requests.post(API_URL, headers=API_HEADERS, params=API_PARAMS, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    # 兼容 list 或 {dataList/result/data}
-    if isinstance(data, list):
-        lst = data
-    else:
-        lst = data.get("dataList") or data.get("result") or data.get("data") or []
-    if not isinstance(lst, list):
-        raise RuntimeError("API dataList 不是列表")
-    return lst
-
-def transform(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    把每条记录补齐 INSERT 所需的全部键；
-    - dateStr 缺省用雅加达“昨天” (DATE_STR)
-    - 兼容若干大小写或别名字段
-    """
-    out: List[Dict[str, Any]] = []
-    for r in records:
-        rec = {
-            # 唯一键
-            "deviceNo":        r.get("deviceNo") or r.get("DEVICE_NO") or "",
-            "projectName":     r.get("projectName"),
-            "dateStr":         normalize_date(r.get("dateStr") or DATE_STR),
-
-            # 其它字段（可为 None）
-            "rentType":        r.get("rentType"),
-            "mechanicalNo":    r.get("mechanicalNo"),
-            "createTime":      r.get("createTime"),
-            "typeName":        r.get("typeName"),
-            "carType":         r.get("carType") or r.get("catType"),
-
-            "validDuration":   r.get("validDuration"),
-            "idlingDuration":  r.get("idlingDuration") or r.get("idingDuration"),
-            "validPercent":    r.get("validPercent"),
-            "dayOil":          r.get("dayOil"),
-            "dayRefuel":       r.get("dayRefuel"),
-            "dayMileage":      r.get("dayMileage"),
-
-            "workhourAvgOil":  r.get("workhourAvgOil") or r.get("workHourAvgOil"),
-            "transportAvgOil": r.get("transportAvgOil"),
-
-            "companyAssets":   r.get("companyAssets"),
-            "belongLand":      r.get("belongLand"),
-            "score":           r.get("score"),
-            "summary":         r.get("summary"),
-        }
-        out.append(rec)
-    return out
-
-def get_conn():
-    return mysql.connector.connect(**DB_CONFIG)
-
-def ensure_table(cur):
-    cur.execute(TABLE_SCHEMA_SQL)
+        resp = requests.post(API_URL, headers=API_HEADERS, params={"dateStr": date_str}, timeout=30)
+        resp.raise_for_status()
+        return resp.json().get("result", [])
+    except Exception as e:
+        logging.error(f"API 请求失败: {e}")
+        return []
 
 def insert_records(records: List[Dict[str, Any]]):
     if not records:
-        logging.info("无新增数据")
+        logging.info("无数据写入")
         return
-    conn = get_conn()
-    cur = conn.cursor()
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor()
     try:
-        ensure_table(cur)
-        cur.executemany(INSERT_SQL, records)
+        cursor.execute(TABLE_SCHEMA_SQL)
+        cursor.executemany(INSERT_SQL, records)
         conn.commit()
-        logging.info(f"写入 {cur.rowcount} 条")
+        logging.info(f"成功写入 {cursor.rowcount} 条记录")
+    except mysql.connector.Error as err:
+        conn.rollback()
+        logging.error(f"写入失败: {err}")
     finally:
-        cur.close()
+        cursor.close()
         conn.close()
 
 def main():
-    logging.info(f"开始同步（雅加达昨天={DATE_STR}）")
-    rows = fetch_api()
-    logging.info(f"API 返回 {len(rows)} 条")
-    if rows:
-        logging.info(f"样例 device/date：({rows[0].get('deviceNo')}, {rows[0].get('dateStr')})")
-    records = transform(rows)          # ← 关键：先补齐字段
-    insert_records(records)
-    logging.info("完成")
+    if len(sys.argv) == 3:  # 支持批量
+        start_date = datetime.strptime(sys.argv[1], "%Y-%m-%d")
+        end_date = datetime.strptime(sys.argv[2], "%Y-%m-%d")
+        cur = start_date
+        while cur <= end_date:
+            d = cur.strftime("%Y-%m-%d")
+            logging.info(f"拉取日期 {d}")
+            rows = fetch_api(d)
+            insert_records(rows)
+            cur += timedelta(days=1)
+    else:  # 默认昨天
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        logging.info(f"拉取昨天 {yesterday}")
+        rows = fetch_api(yesterday)
+        insert_records(rows)
 
 if __name__ == "__main__":
     main()
