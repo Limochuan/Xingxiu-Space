@@ -1,8 +1,8 @@
 """
 Script: sync_xingxiu_data.py
-Purpose: 每天雅加达 01:30 抓“昨天”的接口数据，入库到表 `xingxiu`（首次自动建表，字段含中文注释）
-Author: Jimmy 张杰铭
-Updated: 2025-09-22
+Purpose: 每天雅加达 01:30 抓“昨天”的接口数据，入库到表 `xingxiu`
+Notes:
+POST + Query Params (?dateStr=YYYY-MM-DD[&key=...])
 """
 
 import os
@@ -23,16 +23,15 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
-# ---------------- 接口配置（POST + Query Params） ----------------
+# ---- 接口配置 ----
 API_URL = "http://119.47.88.14:81/admin/common/mechanical/ai_export"
 API_HEADERS = {"Accept": "application/json"}
 
 def jakarta_yesterday_str() -> str:
-    """雅加达时区的昨天 YYYY-MM-DD"""
     now_jkt = datetime.now(ZoneInfo("Asia/Jakarta"))
     return (now_jkt - timedelta(days=1)).strftime("%Y-%m-%d")
 
-# 允许命令行传日期；否则按“雅加达昨天”
+# 支持命令行覆盖日期；默认“雅加达昨天”
 DATE_STR = sys.argv[1].strip() if len(sys.argv) > 1 and sys.argv[1].strip() else jakarta_yesterday_str()
 
 # 可选 key（Secrets 里设置 API_KEY）
@@ -40,7 +39,7 @@ API_PARAMS = {"dateStr": DATE_STR}
 if os.getenv("API_KEY"):
     API_PARAMS["key"] = os.getenv("API_KEY")
 
-# ---------------- 数据库配置（DB_NAME 设为你的库，如 xingxiu_db） ----------------
+# ---- DB 配置（DB_NAME 设为你的库名，例如 xingxiu_db）----
 DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
     "port": int(os.getenv("DB_PORT", "3306")),
@@ -83,7 +82,7 @@ CREATE TABLE IF NOT EXISTS `{TABLE_NAME}` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='星宿日报数据';
 """
 
-# 插入（设备+日期去重）
+# 插入/更新（设备+日期去重）
 INSERT_SQL = f"""
 INSERT INTO `{TABLE_NAME}` (
   DEVICE_NO, PROJECT_NAME, DATE_STR, RENT_TYPE, MECHANICAL_NO, CREATE_TIME,
@@ -116,7 +115,6 @@ INSERT INTO `{TABLE_NAME}` (
   SUMMARY=VALUES(SUMMARY);
 """
 
-# ---- 小工具 ----
 def normalize_date(s: str) -> str:
     try:
         y, m, d = [int(i) for i in str(s).split("-")]
@@ -124,12 +122,12 @@ def normalize_date(s: str) -> str:
     except Exception:
         return str(s)
 
-# ---- API ----
 def fetch_api() -> List[Dict[str, Any]]:
     logging.info(f"POST {API_URL} params={API_PARAMS}")
     r = requests.post(API_URL, headers=API_HEADERS, params=API_PARAMS, timeout=20)
     r.raise_for_status()
     data = r.json()
+    # 兼容 list 或 {dataList/result/data}
     if isinstance(data, list):
         lst = data
     else:
@@ -139,12 +137,44 @@ def fetch_api() -> List[Dict[str, Any]]:
     return lst
 
 def transform(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    把每条记录补齐 INSERT 所需的全部键；
+    - dateStr 缺省用雅加达“昨天” (DATE_STR)
+    - 兼容若干大小写或别名字段
+    """
+    out: List[Dict[str, Any]] = []
     for r in records:
-        if r.get("dateStr"):
-            r["dateStr"] = normalize_date(r["dateStr"])
-    return records
+        rec = {
+            # 唯一键
+            "deviceNo":        r.get("deviceNo") or r.get("DEVICE_NO") or "",
+            "projectName":     r.get("projectName"),
+            "dateStr":         normalize_date(r.get("dateStr") or DATE_STR),
 
-# ---- DB ----
+            # 其它字段（可为 None）
+            "rentType":        r.get("rentType"),
+            "mechanicalNo":    r.get("mechanicalNo"),
+            "createTime":      r.get("createTime"),
+            "typeName":        r.get("typeName"),
+            "carType":         r.get("carType") or r.get("catType"),
+
+            "validDuration":   r.get("validDuration"),
+            "idlingDuration":  r.get("idlingDuration") or r.get("idingDuration"),
+            "validPercent":    r.get("validPercent"),
+            "dayOil":          r.get("dayOil"),
+            "dayRefuel":       r.get("dayRefuel"),
+            "dayMileage":      r.get("dayMileage"),
+
+            "workhourAvgOil":  r.get("workhourAvgOil") or r.get("workHourAvgOil"),
+            "transportAvgOil": r.get("transportAvgOil"),
+
+            "companyAssets":   r.get("companyAssets"),
+            "belongLand":      r.get("belongLand"),
+            "score":           r.get("score"),
+            "summary":         r.get("summary"),
+        }
+        out.append(rec)
+    return out
+
 def get_conn():
     return mysql.connector.connect(**DB_CONFIG)
 
@@ -166,14 +196,14 @@ def insert_records(records: List[Dict[str, Any]]):
         cur.close()
         conn.close()
 
-# ---- 主流程 ----
 def main():
     logging.info(f"开始同步（雅加达昨天={DATE_STR}）")
     rows = fetch_api()
     logging.info(f"API 返回 {len(rows)} 条")
     if rows:
         logging.info(f"样例 device/date：({rows[0].get('deviceNo')}, {rows[0].get('dateStr')})")
-    insert_records(transform(rows))
+    records = transform(rows)          # ← 关键：先补齐字段
+    insert_records(records)
     logging.info("完成")
 
 if __name__ == "__main__":
