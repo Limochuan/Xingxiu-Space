@@ -21,6 +21,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r daily_sync/requirements.txt
 
+      # 新增：连通性测试
+      - name: Connectivity test to API
+        run: |
+          echo "Testing API connectivity..."
+          curl -v --connect-timeout 15 "http://119.47.88.14:81/admin/common/mechanical/ai_export?dateStr=2025-09-21" || true
+
       - name: Run sync script
         env:
           DB_HOST: ${{ secrets.DB_HOST }}
