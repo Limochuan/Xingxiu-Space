@@ -1,0 +1,38 @@
+name: Backfill Xingxiu (2025-09-01..2025-09-22)
+
+on:
+  workflow_dispatch:   # 手动触发
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install -r daily_sync/requirements.txt
+
+      - name: Run backfill loop (2025-09-01..2025-09-22)
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          API_KEY: ${{ secrets.API_KEY }}
+        run: |
+          start=2025-09-01
+          end=2025-09-22
+          d="$start"
+          while true; do
+            echo ">>> Running for $d"
+            python daily_sync/sync_xingxiu_data.py "$d"
+            if [ "$d" = "$end" ]; then break; fi
+            d=$(date -d "$d + 1 day" +%Y-%m-%d)
+          done
