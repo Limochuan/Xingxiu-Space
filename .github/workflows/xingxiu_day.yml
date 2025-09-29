@@ -1,0 +1,45 @@
+name: Backfill Xingxiu (datetime inputs, date-only script)
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Start datetime (ISO 8601)"
+        required: true
+        type: string
+      end:
+        description: "End datetime (ISO 8601, inclusive)"
+        required: true
+        type: string
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - run: pip install -r daily_sync/requirements.txt
+
+      - name: Run backfill (date-only)
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          API_KEY: ${{ secrets.API_KEY }}
+        run: |
+          start="${{ github.event.inputs.start }}"
+          end="${{ github.event.inputs.end }}"
+
+          d=$(date -d "$start" +%Y-%m-%d)
+          last=$(date -d "$end" +%Y-%m-%d)
+
+          while true; do
+            echo ">>> Running for $d"
+            python daily_sync/sync_xingxiu_data.py "$d"
+            if [ "$d" = "$last" ]; then break; fi
+            d=$(date -d "$d + 1 day" +%Y-%m-%d)
+          done
